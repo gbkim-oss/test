@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 DB_PATH = Path(__file__).resolve().parent / "marketing.db"
@@ -34,6 +35,42 @@ def _is_locked() -> bool:
 
 def _remaining_lock_seconds() -> int:
     return max(0, int(st.session_state.lock_until - time.time()))
+
+
+def _cost_vs_revenue_figure(daily: pd.DataFrame) -> go.Figure:
+    x = daily["일자"]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=x,
+            y=daily["cost"],
+            name="광고비",
+            marker_color="#4834d4",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=daily["revenue"],
+            name="매출",
+            mode="lines+markers",
+            line=dict(color="#f0932b", width=2),
+            marker=dict(color="#f0932b", size=6),
+        )
+    )
+    fig.update_layout(
+        legend=dict(
+            x=0.99,
+            y=0.99,
+            xanchor="right",
+            yanchor="top",
+        ),
+        margin=dict(l=48, r=24, t=24, b=48),
+        xaxis_title="일자",
+        yaxis_title="금액 (원)",
+        hovermode="x unified",
+    )
+    return fig
 
 
 @st.cache_data
@@ -175,8 +212,12 @@ def render_dashboard() -> None:
         .sort_values("day")
         .rename(columns={"day": "일자"})
     )
-    st.subheader("일별 비용·매출 추이")
-    st.line_chart(daily.set_index("일자")[["cost", "revenue"]])
+    st.subheader("광고비 vs 매출")
+    st.plotly_chart(
+        _cost_vs_revenue_figure(daily),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
 
     by_ch = (
         df.groupby("channel", as_index=False)
