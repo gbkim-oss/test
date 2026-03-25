@@ -73,6 +73,115 @@ def _cost_vs_revenue_figure(daily: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def _pct_change(curr: float, prev: float) -> float:
+    if prev != 0:
+        return (curr - prev) / prev * 100.0
+    if curr != 0:
+        return float("inf")
+    return float("nan")
+
+
+def _wow_cell_style(v: float) -> str:
+    if v != v:
+        return ""
+    if v == float("inf") or v > 0:
+        return "color: #2e7d32; font-weight: 600;"
+    if v < 0:
+        return "color: #c62828; font-weight: 600;"
+    return ""
+
+
+def _format_wow_cell(v: float) -> str:
+    if v != v:
+        return "—"
+    if v == float("inf"):
+        return "신규"
+    return f"{v:+.1f}%"
+
+
+def render_weekly_channel_wow(df: pd.DataFrame) -> None:
+    st.subheader("주간 채널 성과 비교 (WoW)")
+    end_ts = pd.Timestamp(df["date"].max()).normalize()
+    this_start = end_ts - pd.Timedelta(days=6)
+    prev_end = end_ts - pd.Timedelta(days=7)
+    prev_start = end_ts - pd.Timedelta(days=13)
+
+    st.caption(
+        f"이번 주(최근 7일): {this_start.date()} ~ {end_ts.date()}  |  "
+        f"전주(직전 7일): {prev_start.date()} ~ {prev_end.date()}"
+    )
+
+    dnorm = df["date"].dt.normalize()
+    mask_this = (dnorm >= this_start) & (dnorm <= end_ts)
+    mask_prev = (dnorm >= prev_start) & (dnorm <= prev_end)
+
+    if not mask_this.any():
+        st.info("이번 주 구간에 데이터가 없습니다.")
+        return
+
+    def by_channel(sub: pd.DataFrame) -> pd.DataFrame:
+        if sub.empty:
+            return pd.DataFrame(columns=["channel", "cost", "revenue", "conversions"])
+        return sub.groupby("channel", as_index=False).agg(
+            cost=("cost", "sum"),
+            revenue=("revenue", "sum"),
+            conversions=("conversions", "sum"),
+        )
+
+    cur_df = by_channel(df.loc[mask_this])
+    prev_df = by_channel(df.loc[mask_prev])
+    merged = cur_df.merge(prev_df, on="channel", how="outer", suffixes=("_t", "_p")).fillna(0.0)
+
+    rows = []
+    for _, r in merged.iterrows():
+        c_t, c_p = float(r["cost_t"]), float(r["cost_p"])
+        rv_t, rv_p = float(r["revenue_t"]), float(r["revenue_p"])
+        cv_t, cv_p = float(r["conversions_t"]), float(r["conversions_p"])
+        roas_t = rv_t / c_t if c_t else 0.0
+        roas_p = rv_p / c_p if c_p else 0.0
+        rows.append(
+            {
+                "채널": r["channel"],
+                "광고비(이번주)": int(c_t),
+                "광고비(전주)": int(c_p),
+                "광고비 증감(%)": _pct_change(c_t, c_p),
+                "매출(이번주)": int(rv_t),
+                "매출(전주)": int(rv_p),
+                "매출 증감(%)": _pct_change(rv_t, rv_p),
+                "ROAS(이번)": roas_t,
+                "ROAS(전)": roas_p,
+                "ROAS 증감(%)": _pct_change(roas_t, roas_p),
+                "전환(이번주)": int(cv_t),
+                "전환(전주)": int(cv_p),
+                "전환 증감(%)": _pct_change(cv_t, cv_p),
+            }
+        )
+
+    out = pd.DataFrame(rows).sort_values("광고비(이번주)", ascending=False).reset_index(drop=True)
+    wow_cols = [
+        "광고비 증감(%)",
+        "매출 증감(%)",
+        "ROAS 증감(%)",
+        "전환 증감(%)",
+    ]
+    fmt = {
+        "광고비(이번주)": "{:,.0f}원",
+        "광고비(전주)": "{:,.0f}원",
+        "매출(이번주)": "{:,.0f}원",
+        "매출(전주)": "{:,.0f}원",
+        "전환(이번주)": "{:,.0f}",
+        "전환(전주)": "{:,.0f}",
+        "ROAS(이번)": "{:.2f}",
+        "ROAS(전)": "{:.2f}",
+        "광고비 증감(%)": _format_wow_cell,
+        "매출 증감(%)": _format_wow_cell,
+        "ROAS 증감(%)": _format_wow_cell,
+        "전환 증감(%)": _format_wow_cell,
+    }
+    styler = out.style.map(_wow_cell_style, subset=wow_cols).format(fmt, na_rep="—")
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+
 @st.cache_data
 def load_report() -> pd.DataFrame:
     if not DB_PATH.is_file():
@@ -235,6 +344,8 @@ def render_dashboard() -> None:
     )
     st.subheader("캠페인 매출 상위 15")
     st.bar_chart(by_camp.set_index("campaign")["revenue"])
+
+    render_weekly_channel_wow(df)
 
     with st.expander("필터 적용 원본 데이터"):
         show = df.sort_values(["date", "channel", "campaign"]).copy()
