@@ -1,6 +1,8 @@
 import hashlib
+import io
 import sqlite3
 import time
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +10,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 DB_PATH = Path(__file__).resolve().parent / "marketing.db"
+CSV_UPLOAD_TABLE = "csv_upload"
+APP_TITLE = "우리팀 광고 대시보드"
+APP_PAGE_ICON = "🎯"
+SIDEBAR_VERSION_LABEL = "마케팅팀 v1.0"
+_WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
 ADMIN_ID = "admin"
 ADMIN_PASSWORD_SHA256 = (
     "ac9689e2272427085e35b9d3e3e8bed88cb3434828b43b86fc0596cad4c6e270"
@@ -89,6 +96,12 @@ def _wow_cell_style(v: float) -> str:
     if v < 0:
         return "color: #c62828; font-weight: 600;"
     return ""
+
+
+def _today_caption_ko() -> str:
+    t = date.today()
+    w = _WEEKDAYS_KO[t.weekday()]
+    return f"{t.year}년 {t.month}월 {t.day}일 ({w})"
 
 
 def _format_wow_cell(v: float) -> str:
@@ -198,9 +211,77 @@ def load_report() -> pd.DataFrame:
     return df
 
 
+def render_csv_upload_subtab() -> None:
+    st.subheader("CSV 업로드")
+    uploaded = st.file_uploader("CSV 파일 선택", type=["csv"], key="csv_file_uploader")
+
+    if uploaded is None:
+        st.info("미리보기·차트·DB 저장을 위해 CSV 파일을 업로드하세요.")
+        return
+
+    try:
+        raw = uploaded.getvalue()
+        df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(io.BytesIO(raw), encoding="cp949", encoding_errors="replace")
+
+    st.caption(f"파일: **{uploaded.name}** · 행 {len(df):,} · 열 {len(df.columns)}")
+    st.write("**미리보기**")
+    st.dataframe(df, use_container_width=True, height=320)
+
+    cols = [str(c) for c in df.columns.tolist()]
+    if len(cols) < 2:
+        st.warning("막대 차트를 만들려면 열이 2개 이상이어야 합니다.")
+        return
+
+    num_cols = df.select_dtypes(include=["number"]).columns.astype(str).tolist()
+    y_choices = [c for c in cols if c in num_cols]
+    if not y_choices:
+        y_choices = cols
+
+    c1, c2 = st.columns(2)
+    with c1:
+        x_col = st.selectbox("X축 열", options=cols, key="csv_x")
+    with c2:
+        y_col = st.selectbox("Y축 열", options=y_choices, key="csv_y")
+
+    y_series = pd.to_numeric(df[y_col], errors="coerce")
+    if y_series.notna().sum() == 0:
+        st.error("Y축 열을 숫자로 해석할 수 없습니다. 다른 열을 선택하세요.")
+        return
+
+    plot_df = df[[x_col, y_col]].copy()
+    plot_df[y_col] = pd.to_numeric(plot_df[y_col], errors="coerce")
+    plot_df = plot_df.dropna(subset=[y_col])
+    if plot_df.empty:
+        st.warning("차트로 그릴 유효한 행이 없습니다.")
+        return
+
+    agg = plot_df.groupby(x_col, dropna=False, as_index=False)[y_col].sum()
+    st.write("**선택 열 기준 막대 차트**")
+    st.bar_chart(agg.set_index(x_col)[y_col])
+
+    if st.button("DB에 저장", key="csv_save_db"):
+        out = df.copy()
+        out.insert(0, "uploaded_at", datetime.now().isoformat(timespec="seconds"))
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                out.to_sql(CSV_UPLOAD_TABLE, conn, if_exists="append", index=False)
+            finally:
+                conn.close()
+        except Exception as e:
+            st.error(f"저장에 실패했습니다: {e}")
+        else:
+            st.success(
+                f"`{CSV_UPLOAD_TABLE}` 테이블에 {len(out):,}행을 저장했습니다. ({DB_PATH.name})"
+            )
+
+
 def render_login() -> None:
-    st.title("마케팅 대시보드")
-    st.subheader("로그인")
+    st.title(APP_TITLE)
+    st.subheader("팀 계정 로그인")
+    st.caption("사내 전용입니다. 배정된 아이디와 비밀번호로 접속하세요.")
 
     if _is_locked():
         r = _remaining_lock_seconds()
@@ -241,36 +322,44 @@ def render_login() -> None:
         st.error(f"아이디 또는 비밀번호가 올바르지 않습니다. ({left}회 남음)")
 
 
-def render_dashboard() -> None:
-    df_all = load_report()
-    if df_all.empty:
-        st.error(f"DB를 찾을 수 없거나 데이터가 없습니다: {DB_PATH}")
-        return
+def render_authenticated_app() -> None:
+    st.title(APP_TITLE)
 
-    st.title("마케팅 성과 대시보드")
+    df_all = load_report()
+    tab_dash, tab_inquiry = st.tabs(["대시보드", "데이터 조회"])
 
     with st.sidebar:
-        st.header("필터")
-        dmin = df_all["date"].min().date()
-        dmax = df_all["date"].max().date()
-        dr = st.date_input(
-            "기간",
-            value=(dmin, dmax),
-            min_value=dmin,
-            max_value=dmax,
-        )
-        if isinstance(dr, tuple) and len(dr) == 2:
-            start_d, end_d = dr[0], dr[1]
+        st.markdown(f"**{SIDEBAR_VERSION_LABEL}**")
+        st.caption(_today_caption_ko())
+        st.divider()
+        st.caption("아래 필터는 **대시보드** 탭에만 적용됩니다.")
+        if df_all.empty:
+            st.warning("리포트 DB가 비어 있거나 없습니다.")
+            start_d = end_d = None
+            sel_ch = []
+            sel_camp = []
         else:
-            start_d = end_d = dr if not isinstance(dr, tuple) else dr[0]
+            st.header("필터")
+            dmin = df_all["date"].min().date()
+            dmax = df_all["date"].max().date()
+            dr = st.date_input(
+                "기간",
+                value=(dmin, dmax),
+                min_value=dmin,
+                max_value=dmax,
+            )
+            if isinstance(dr, tuple) and len(dr) == 2:
+                start_d, end_d = dr[0], dr[1]
+            else:
+                start_d = end_d = dr if not isinstance(dr, tuple) else dr[0]
 
-        channels = sorted(df_all["channel"].unique().tolist())
-        sel_ch = st.multiselect("채널", options=channels, default=channels)
+            channels = sorted(df_all["channel"].unique().tolist())
+            sel_ch = st.multiselect("채널", options=channels, default=channels)
 
-        camp_opts = sorted(
-            df_all[df_all["channel"].isin(sel_ch)]["campaign"].unique().tolist()
-        )
-        sel_camp = st.multiselect("캠페인", options=camp_opts, default=camp_opts)
+            camp_opts = sorted(
+                df_all[df_all["channel"].isin(sel_ch)]["campaign"].unique().tolist()
+            )
+            sel_camp = st.multiselect("캠페인", options=camp_opts, default=camp_opts)
 
         st.divider()
         if st.button("로그아웃"):
@@ -279,83 +368,94 @@ def render_dashboard() -> None:
             st.session_state.lock_until = 0.0
             st.rerun()
 
-    mask = (
-        (df_all["date"].dt.date >= start_d)
-        & (df_all["date"].dt.date <= end_d)
-        & (df_all["channel"].isin(sel_ch))
-        & (df_all["campaign"].isin(sel_camp))
-    )
-    df = df_all.loc[mask].copy()
+    with tab_dash:
+        st.header("마케팅 성과 대시보드")
+        if df_all.empty:
+            st.error(f"DB를 찾을 수 없거나 데이터가 없습니다: {DB_PATH}")
+        else:
+            mask = (
+                (df_all["date"].dt.date >= start_d)
+                & (df_all["date"].dt.date <= end_d)
+                & (df_all["channel"].isin(sel_ch))
+                & (df_all["campaign"].isin(sel_camp))
+            )
+            df = df_all.loc[mask].copy()
 
-    if df.empty:
-        st.info("선택한 필터에 맞는 데이터가 없습니다.")
-        return
+            if df.empty:
+                st.info("선택한 필터에 맞는 데이터가 없습니다.")
+            else:
+                total_cost = int(df["cost"].sum())
+                total_rev = int(df["revenue"].sum())
+                total_imp = int(df["impressions"].sum())
+                total_clk = int(df["clicks"].sum())
+                total_conv = int(df["conversions"].sum())
+                roas = total_rev / total_cost if total_cost else 0.0
+                ctr = (total_clk / total_imp * 100) if total_imp else 0.0
+                cvr = (total_conv / total_clk * 100) if total_clk else 0.0
 
-    total_cost = int(df["cost"].sum())
-    total_rev = int(df["revenue"].sum())
-    total_imp = int(df["impressions"].sum())
-    total_clk = int(df["clicks"].sum())
-    total_conv = int(df["conversions"].sum())
-    roas = total_rev / total_cost if total_cost else 0.0
-    ctr = (total_clk / total_imp * 100) if total_imp else 0.0
-    cvr = (total_conv / total_clk * 100) if total_clk else 0.0
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("총 비용", f"{total_cost:,}원")
+                c2.metric("총 매출", f"{total_rev:,}원")
+                c3.metric("ROAS", f"{roas:.2f}")
+                c4.metric("CTR", f"{ctr:.2f}%")
+                c5.metric("CVR", f"{cvr:.2f}%")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("총 비용", f"{total_cost:,}원")
-    c2.metric("총 매출", f"{total_rev:,}원")
-    c3.metric("ROAS", f"{roas:.2f}")
-    c4.metric("CTR", f"{ctr:.2f}%")
-    c5.metric("CVR", f"{cvr:.2f}%")
+                avg_cpc = total_cost / total_clk if total_clk else 0.0
+                r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+                r2c1.metric("총 클릭수", f"{total_clk:,}")
+                r2c2.metric("총 노출수", f"{total_imp:,}")
+                r2c3.metric("평균 CTR(%)", f"{ctr:.2f}%")
+                r2c4.metric("평균 CPC(원)", f"{avg_cpc:,.0f}원")
 
-    avg_cpc = total_cost / total_clk if total_clk else 0.0
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    r2c1.metric("총 클릭수", f"{total_clk:,}")
-    r2c2.metric("총 노출수", f"{total_imp:,}")
-    r2c3.metric("평균 CTR(%)", f"{ctr:.2f}%")
-    r2c4.metric("평균 CPC(원)", f"{avg_cpc:,.0f}원")
+                daily = (
+                    df.assign(day=df["date"].dt.date)
+                    .groupby("day", as_index=False)
+                    .agg(cost=("cost", "sum"), revenue=("revenue", "sum"))
+                    .sort_values("day")
+                    .rename(columns={"day": "일자"})
+                )
+                st.subheader("광고비 vs 매출")
+                st.plotly_chart(
+                    _cost_vs_revenue_figure(daily),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
 
-    daily = (
-        df.assign(day=df["date"].dt.date)
-        .groupby("day", as_index=False)
-        .agg(cost=("cost", "sum"), revenue=("revenue", "sum"))
-        .sort_values("day")
-        .rename(columns={"day": "일자"})
-    )
-    st.subheader("광고비 vs 매출")
-    st.plotly_chart(
-        _cost_vs_revenue_figure(daily),
-        use_container_width=True,
-        config={"displayModeBar": False},
-    )
+                by_ch = (
+                    df.groupby("channel", as_index=False)
+                    .agg(cost=("cost", "sum"), revenue=("revenue", "sum"), clicks=("clicks", "sum"))
+                    .sort_values("cost", ascending=False)
+                )
+                st.subheader("채널별 비용·매출")
+                st.bar_chart(by_ch.set_index("channel")[["cost", "revenue"]])
 
-    by_ch = (
-        df.groupby("channel", as_index=False)
-        .agg(cost=("cost", "sum"), revenue=("revenue", "sum"), clicks=("clicks", "sum"))
-        .sort_values("cost", ascending=False)
-    )
-    st.subheader("채널별 비용·매출")
-    st.bar_chart(by_ch.set_index("channel")[["cost", "revenue"]])
+                by_camp = (
+                    df.groupby("campaign", as_index=False)
+                    .agg(cost=("cost", "sum"), revenue=("revenue", "sum"))
+                    .sort_values("revenue", ascending=False)
+                    .head(15)
+                )
+                st.subheader("캠페인 매출 상위 15")
+                st.bar_chart(by_camp.set_index("campaign")["revenue"])
 
-    by_camp = (
-        df.groupby("campaign", as_index=False)
-        .agg(cost=("cost", "sum"), revenue=("revenue", "sum"))
-        .sort_values("revenue", ascending=False)
-        .head(15)
-    )
-    st.subheader("캠페인 매출 상위 15")
-    st.bar_chart(by_camp.set_index("campaign")["revenue"])
+                render_weekly_channel_wow(df)
 
-    render_weekly_channel_wow(df)
+                with st.expander("필터 적용 원본 데이터"):
+                    show = df.sort_values(["date", "channel", "campaign"]).copy()
+                    show["date"] = show["date"].dt.strftime("%Y-%m-%d")
+                    st.dataframe(show, use_container_width=True, hide_index=True)
 
-    with st.expander("필터 적용 원본 데이터"):
-        show = df.sort_values(["date", "channel", "campaign"]).copy()
-        show["date"] = show["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(show, use_container_width=True, hide_index=True)
+    with tab_inquiry:
+        st.header("데이터 조회")
+        sub_csv, = st.tabs(["CSV 업로드"])
+        with sub_csv:
+            render_csv_upload_subtab()
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="마케팅 대시보드",
+        page_title=APP_TITLE,
+        page_icon=APP_PAGE_ICON,
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -365,7 +465,7 @@ def main() -> None:
         render_login()
         return
 
-    render_dashboard()
+    render_authenticated_app()
 
 
 if __name__ == "__main__":
