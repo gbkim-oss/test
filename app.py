@@ -161,6 +161,13 @@ def render_dashboard() -> None:
     c4.metric("CTR", f"{ctr:.2f}%")
     c5.metric("CVR", f"{cvr:.2f}%")
 
+    avg_cpc = total_cost / total_clk if total_clk else 0.0
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("총 클릭수", f"{total_clk:,}")
+    r2c2.metric("총 노출수", f"{total_imp:,}")
+    r2c3.metric("평균 CTR(%)", f"{ctr:.2f}%")
+    r2c4.metric("평균 CPC(원)", f"{avg_cpc:,.0f}원")
+
     daily = (
         df.assign(day=df["date"].dt.date)
         .groupby("day", as_index=False)
